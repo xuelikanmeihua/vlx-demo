@@ -1,0 +1,22 @@
+# Keep secrets, local state, and VCS metadata out of the Docker build context.
+.git
+.gitmodules
+
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+.env
+.env.*
+
+.pytest_cache/
+tests/
+
+# Model weights / detector checkpoints — too large for an image layer;
+# mount or download them at runtime instead (see README).
+resources/
+
+*_result.png
+.DS_Store

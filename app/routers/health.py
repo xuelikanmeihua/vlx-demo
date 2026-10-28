@@ -17,4 +17,5 @@ async def healthz() -> dict:
 @router.get("/readyz", response_model=ReadinessResponse)
 async def readyz(request: Request) -> ReadinessResponse:
     manager: ModelManager = request.app.state.model_manager
-    return ReadinessResponse(model_loaded=manager.is_model_loaded, device=manager.device)
+    device = await manager.adevice()
+    return ReadinessResponse(model_loaded=manager.is_model_loaded, device=device)

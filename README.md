@@ -14,7 +14,7 @@ responses.
 
 ```
 app/
-├── main.py            FastAPI app, lifespan (lazy model load), global error handler
+├── main.py            FastAPI app, lifespan, body-size middleware, global error handler
 ├── config.py           Settings from environment variables (VLX_API_*)
 ├── vendor.py           Wires third_party/VLX-Seek onto sys.path; re-exports its API
 ├── model_manager.py     Lazily loads VLXSeekWorker; runs blocking inference
@@ -55,8 +55,13 @@ for task semantics.
 | GET | `/healthz` / `/readyz` | — | liveness / model-loaded + device, unauthenticated |
 
 Common optional fields on generation endpoints: `lang` (`en`/`zh`),
-`max_new_tokens`, `temperature`, `top_p`, `repetition_penalty`, and
-`visualize` (returns `visualization_base64`, a PNG with result boxes drawn).
+`max_new_tokens` (capped at `VLX_API_MAX_NEW_TOKENS_LIMIT`), `temperature`,
+`top_p`, `repetition_penalty`, and `visualize` (returns
+`visualization_base64`, a PNG with result boxes drawn). These four
+generation fields, plus the box-resolution/visualization logic shared by
+the detection-family and region endpoints, live in one place
+(`_generation_params`/`_proposal_task`/`_region_task` in
+`app/routers/inference.py`) rather than being repeated per route.
 
 When `bbox_list` is omitted on a detection-family endpoint and
 `auto_propose` is true (default), the service runs VLX-Seek's bundled
@@ -151,6 +156,11 @@ Apple Silicon, adapt it from the matching Dockerfile under
 running directly on the macOS host — Docker cannot reach the host's MPS
 driver).
 
+`.dockerignore` excludes `.git/`, `.venv/`, `.env`, and `resources/` from
+the build context — without it, `COPY . .` would bake local git credentials
+and any downloaded weights straight into the image. Keep it in sync if you
+add other local-only directories.
+
 ## Operational notes
 
 - **Concurrency:** inference runs on a small thread pool
@@ -161,7 +171,18 @@ driver).
   `/v1/*` route. `/healthz` and `/readyz` stay open for orchestrator probes.
 - **Images:** accepted as a file upload or base64 string only — there is
   deliberately no fetch-by-URL option, to avoid giving this externally
-  facing API an SSRF vector. Max size is `VLX_API_MAX_IMAGE_BYTES`.
+  facing API an SSRF vector. Max size is `VLX_API_MAX_IMAGE_BYTES`, enforced
+  via chunked reads so an oversized payload is rejected without being fully
+  buffered. `VLX_API_MAX_REQUEST_BYTES` adds a second check at the ASGI
+  layer, via the `Content-Length` header, before the body is read at all
+  (requests sent without a `Content-Length`, e.g. chunked transfer encoding,
+  still fall through to the per-field check).
+- **Generation limits:** `max_new_tokens` is capped at
+  `VLX_API_MAX_NEW_TOKENS_LIMIT` (default `4096`) on every generation
+  endpoint, and `bbox_list`/`target_region_indexes` are capped at
+  `VLX_API_MAX_BOXES_PER_REQUEST` (default `200`) items — both guard against
+  a single request tying up the (by default, single) inference worker for
+  an unbounded amount of time/memory.
 - **Hardware:** VLX-Seek-1.5-10B needs a GPU with substantial VRAM (BF16);
   CPU/MPS inference is supported by VLX-Seek but is far slower and mainly
   useful for development without a GPU.

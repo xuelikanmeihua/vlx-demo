@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     # should not be hit concurrently by default.
     max_concurrent_inference: int = 1
     max_image_bytes: int = 15 * 1024 * 1024
+    # Rejected at the ASGI layer (via Content-Length) before the body is
+    # read, so it must cover the image plus other multipart fields/overhead.
+    max_request_bytes: int = 20 * 1024 * 1024
+    # Upper bound for `max_new_tokens` on every generation endpoint, and for
+    # the length of caller-supplied `bbox_list` / `target_region_indexes`.
+    max_new_tokens_limit: int = 4096
+    max_boxes_per_request: int = 200
 
     # When set, all /v1/* routes require header `X-API-Key: <api_key>`.
     api_key: str | None = None

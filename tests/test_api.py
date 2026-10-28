@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 
 import pytest
 from fastapi.testclient import TestClient
@@ -213,6 +214,107 @@ def test_tasks_endpoint(client: TestClient) -> None:
     body = resp.json()
     assert "detection" in body["tasks"]
     assert "en" in body["langs"]
+
+
+def test_ground_success(client: TestClient) -> None:
+    resp = client.post(
+        "/v1/ground",
+        data={"description": "the red apple", "bbox_list": "[[1, 2, 10, 12]]"},
+        files={"image": ("test.png", _sample_image_bytes(), "image/png")},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["result_bbox_list"][0]["label"] == "the red apple"
+
+
+def test_count_success(client: TestClient) -> None:
+    resp = client.post(
+        "/v1/count",
+        data={"description": "apples", "bbox_list": "[[1, 2, 10, 12]]"},
+        files={"image": ("test.png", _sample_image_bytes(), "image/png")},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["result_bbox_list"][0]["label"] == "apples"
+
+
+def test_reasoning_detect_success(client: TestClient) -> None:
+    resp = client.post(
+        "/v1/reasoning-detect",
+        data={"text": "a ripe fruit", "bbox_list": "[[1, 2, 10, 12]]"},
+        files={"image": ("test.png", _sample_image_bytes(), "image/png")},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["result_bbox_list"][0]["label"] == "a ripe fruit"
+
+
+def test_region_ocr_success(client: TestClient) -> None:
+    resp = client.post(
+        "/v1/region/ocr",
+        data={"bbox_list": "[[1, 2, 10, 12]]", "target_region_indexes": "[0]"},
+        files={"image": ("test.png", _sample_image_bytes(), "image/png")},
+    )
+    assert resp.status_code == 200
+    assert "[0]" in resp.json()["answer"]
+
+
+def test_predict_raw_prompt(client: TestClient) -> None:
+    resp = client.post(
+        "/v1/predict",
+        data={"prompt": "Describe this image."},
+        files={"image": ("test.png", _sample_image_bytes(), "image/png")},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["answer"] == "fake-answer:Describe this image."
+
+
+def test_worker_value_error_is_mapped_to_400(client: TestClient) -> None:
+    def _raise(*args, **kwargs):
+        raise ValueError("bbox must have positive area after clipping")
+
+    app.state.model_manager._worker.detect = _raise
+
+    resp = client.post(
+        "/v1/detect",
+        data={"text": "orange", "bbox_list": "[[1, 1, 1, 1]]"},
+        files={"image": ("test.png", _sample_image_bytes(), "image/png")},
+    )
+    assert resp.status_code == 400
+    assert "positive area" in resp.json()["detail"]
+
+
+def test_vqa_rejects_max_new_tokens_above_limit(client: TestClient) -> None:
+    resp = client.post(
+        "/v1/vqa",
+        data={"question": "describe", "max_new_tokens": "999999"},
+        files={"image": ("test.png", _sample_image_bytes(), "image/png")},
+    )
+    assert resp.status_code == 422
+
+
+def test_detect_rejects_too_many_boxes(client: TestClient) -> None:
+    from app.config import settings
+
+    too_many = [[0, 0, 1, 1]] * (settings.max_boxes_per_request + 1)
+    resp = client.post(
+        "/v1/detect",
+        data={"text": "orange", "bbox_list": json.dumps(too_many)},
+        files={"image": ("test.png", _sample_image_bytes(), "image/png")},
+    )
+    assert resp.status_code == 400
+
+
+def test_vqa_rejects_oversized_image(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import images
+
+    monkeypatch.setattr(images.settings, "max_image_bytes", 10)
+
+    resp = client.post(
+        "/v1/vqa",
+        data={"question": "describe"},
+        files={"image": ("test.png", _sample_image_bytes(), "image/png")},
+    )
+    assert resp.status_code == 400
 
 
 def test_api_key_enforced_when_configured(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

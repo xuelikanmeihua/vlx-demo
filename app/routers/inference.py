@@ -4,6 +4,11 @@ Each route is a thin adapter over app.vendor.VLXSeekWorker: it decodes the
 image, resolves candidate region boxes (explicit `bbox_list`, or WeDetect
 auto-proposals), calls the worker method that matches the upstream CLI task,
 and optionally renders a visualization of the selected regions.
+
+The four "proposal tasks" (detect/ground/count/reasoning-detect) and the two
+"region tasks" (region/caption, region/ocr) share the same shape and are
+driven by _proposal_task/_region_task instead of being copy-pasted per
+route, so a fix or a new shared field only has to be made once.
 """
 from __future__ import annotations
 
@@ -12,6 +17,7 @@ from typing import Any, Callable, List, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from PIL import Image
 
+from app.config import settings
 from app.images import load_image, parse_json_box_list, parse_json_int_list
 from app.model_manager import ModelManager
 from app.schemas import InferenceResponse, TasksResponse
@@ -32,6 +38,25 @@ async def _image_dep(
     ),
 ) -> Image.Image:
     return await load_image(image, image_base64)
+
+
+def _generation_params(
+    max_new_tokens: int = Form(
+        2048,
+        ge=1,
+        le=settings.max_new_tokens_limit,
+        description=f"Maximum completion length (<= {settings.max_new_tokens_limit}).",
+    ),
+    temperature: float = Form(0.0, ge=0.0, le=2.0),
+    top_p: float = Form(1.0, gt=0.0, le=1.0),
+    repetition_penalty: float = Form(1.0, gt=0.0, le=2.0),
+) -> dict:
+    return {
+        "max_new_tokens": max_new_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "repetition_penalty": repetition_penalty,
+    }
 
 
 async def _run(manager: ModelManager, fn: Callable[[Any], dict]) -> dict:
@@ -70,6 +95,61 @@ def _finalize(
     return response
 
 
+async def _proposal_task(
+    request: Request,
+    image: Image.Image,
+    text: str,
+    lang: str,
+    bbox_list: Optional[str],
+    auto_propose: bool,
+    visualize: bool,
+    gen: dict,
+    worker_method: str,
+) -> InferenceResponse:
+    """Shared body for detect/ground/count/reasoning-detect.
+
+    They differ only in which VLXSeekWorker method to call; everything
+    else (box resolution, the empty-boxes guard, running the call,
+    rendering the response) is identical.
+    """
+    manager = _manager(request)
+    boxes = await _resolve_boxes(manager, image, bbox_list, auto_propose)
+    if not boxes:
+        raise HTTPException(
+            400, "No proposal boxes available; pass `bbox_list` or enable `auto_propose`."
+        )
+    result = await _run(
+        manager,
+        lambda worker: getattr(worker, worker_method)(
+            image, boxes, text, lang=lang, **gen
+        ),
+    )
+    return _finalize(result, image, boxes, visualize)
+
+
+async def _region_task(
+    request: Request,
+    image: Image.Image,
+    bbox_list: str,
+    target_region_indexes: str,
+    lang: str,
+    visualize: bool,
+    gen: dict,
+    worker_method: str,
+) -> InferenceResponse:
+    """Shared body for region/caption and region/ocr."""
+    manager = _manager(request)
+    boxes = parse_json_box_list(bbox_list, "bbox_list")
+    indexes = parse_json_int_list(target_region_indexes, "target_region_indexes")
+    result = await _run(
+        manager,
+        lambda worker: getattr(worker, worker_method)(
+            image, boxes, indexes, lang=lang, **gen
+        ),
+    )
+    return _finalize(result, image, boxes, visualize)
+
+
 @router.get("/tasks", response_model=TasksResponse)
 async def tasks() -> TasksResponse:
     from app.vendor import list_langs, list_tasks
@@ -82,23 +162,10 @@ async def vqa(
     request: Request,
     image: Image.Image = Depends(_image_dep),
     question: str = Form(..., description="Free-form question about the image."),
-    max_new_tokens: int = Form(2048),
-    temperature: float = Form(0.0),
-    top_p: float = Form(1.0),
-    repetition_penalty: float = Form(1.0),
+    gen: dict = Depends(_generation_params),
 ) -> InferenceResponse:
     manager = _manager(request)
-    result = await _run(
-        manager,
-        lambda worker: worker.predict(
-            image,
-            question,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-        ),
-    )
+    result = await _run(manager, lambda worker: worker.predict(image, question, **gen))
     return InferenceResponse(**result)
 
 
@@ -115,29 +182,11 @@ async def detect(
     ),
     auto_propose: bool = Form(True, description="Run WeDetect when `bbox_list` is omitted."),
     visualize: bool = Form(False),
-    max_new_tokens: int = Form(2048),
-    temperature: float = Form(0.0),
-    top_p: float = Form(1.0),
-    repetition_penalty: float = Form(1.0),
+    gen: dict = Depends(_generation_params),
 ) -> InferenceResponse:
-    manager = _manager(request)
-    boxes = await _resolve_boxes(manager, image, bbox_list, auto_propose)
-    if not boxes:
-        raise HTTPException(400, "No proposal boxes available; pass `bbox_list` or enable `auto_propose`.")
-    result = await _run(
-        manager,
-        lambda worker: worker.detect(
-            image,
-            boxes,
-            text,
-            lang=lang,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-        ),
+    return await _proposal_task(
+        request, image, text, lang, bbox_list, auto_propose, visualize, gen, "detect"
     )
-    return _finalize(result, image, boxes, visualize)
 
 
 @router.post("/ground", response_model=InferenceResponse)
@@ -149,29 +198,11 @@ async def ground(
     bbox_list: Optional[str] = Form(None),
     auto_propose: bool = Form(True),
     visualize: bool = Form(False),
-    max_new_tokens: int = Form(2048),
-    temperature: float = Form(0.0),
-    top_p: float = Form(1.0),
-    repetition_penalty: float = Form(1.0),
+    gen: dict = Depends(_generation_params),
 ) -> InferenceResponse:
-    manager = _manager(request)
-    boxes = await _resolve_boxes(manager, image, bbox_list, auto_propose)
-    if not boxes:
-        raise HTTPException(400, "No proposal boxes available; pass `bbox_list` or enable `auto_propose`.")
-    result = await _run(
-        manager,
-        lambda worker: worker.ground(
-            image,
-            boxes,
-            description,
-            lang=lang,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-        ),
+    return await _proposal_task(
+        request, image, description, lang, bbox_list, auto_propose, visualize, gen, "ground"
     )
-    return _finalize(result, image, boxes, visualize)
 
 
 @router.post("/count", response_model=InferenceResponse)
@@ -183,29 +214,11 @@ async def count(
     bbox_list: Optional[str] = Form(None),
     auto_propose: bool = Form(True),
     visualize: bool = Form(False),
-    max_new_tokens: int = Form(2048),
-    temperature: float = Form(0.0),
-    top_p: float = Form(1.0),
-    repetition_penalty: float = Form(1.0),
+    gen: dict = Depends(_generation_params),
 ) -> InferenceResponse:
-    manager = _manager(request)
-    boxes = await _resolve_boxes(manager, image, bbox_list, auto_propose)
-    if not boxes:
-        raise HTTPException(400, "No proposal boxes available; pass `bbox_list` or enable `auto_propose`.")
-    result = await _run(
-        manager,
-        lambda worker: worker.count(
-            image,
-            boxes,
-            description,
-            lang=lang,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-        ),
+    return await _proposal_task(
+        request, image, description, lang, bbox_list, auto_propose, visualize, gen, "count"
     )
-    return _finalize(result, image, boxes, visualize)
 
 
 @router.post("/reasoning-detect", response_model=InferenceResponse)
@@ -217,29 +230,11 @@ async def reasoning_detect(
     bbox_list: Optional[str] = Form(None),
     auto_propose: bool = Form(True),
     visualize: bool = Form(False),
-    max_new_tokens: int = Form(2048),
-    temperature: float = Form(0.0),
-    top_p: float = Form(1.0),
-    repetition_penalty: float = Form(1.0),
+    gen: dict = Depends(_generation_params),
 ) -> InferenceResponse:
-    manager = _manager(request)
-    boxes = await _resolve_boxes(manager, image, bbox_list, auto_propose)
-    if not boxes:
-        raise HTTPException(400, "No proposal boxes available; pass `bbox_list` or enable `auto_propose`.")
-    result = await _run(
-        manager,
-        lambda worker: worker.reasoning_detect(
-            image,
-            boxes,
-            text,
-            lang=lang,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-        ),
+    return await _proposal_task(
+        request, image, text, lang, bbox_list, auto_propose, visualize, gen, "reasoning_detect"
     )
-    return _finalize(result, image, boxes, visualize)
 
 
 @router.post("/region/caption", response_model=InferenceResponse)
@@ -252,28 +247,11 @@ async def region_caption(
     ),
     lang: str = Form("en"),
     visualize: bool = Form(False),
-    max_new_tokens: int = Form(2048),
-    temperature: float = Form(0.0),
-    top_p: float = Form(1.0),
-    repetition_penalty: float = Form(1.0),
+    gen: dict = Depends(_generation_params),
 ) -> InferenceResponse:
-    manager = _manager(request)
-    boxes = parse_json_box_list(bbox_list, "bbox_list")
-    indexes = parse_json_int_list(target_region_indexes, "target_region_indexes")
-    result = await _run(
-        manager,
-        lambda worker: worker.describe_region(
-            image,
-            boxes,
-            indexes,
-            lang=lang,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-        ),
+    return await _region_task(
+        request, image, bbox_list, target_region_indexes, lang, visualize, gen, "describe_region"
     )
-    return _finalize(result, image, boxes, visualize)
 
 
 @router.post("/region/ocr", response_model=InferenceResponse)
@@ -286,28 +264,11 @@ async def region_ocr(
     ),
     lang: str = Form("en"),
     visualize: bool = Form(False),
-    max_new_tokens: int = Form(2048),
-    temperature: float = Form(0.0),
-    top_p: float = Form(1.0),
-    repetition_penalty: float = Form(1.0),
+    gen: dict = Depends(_generation_params),
 ) -> InferenceResponse:
-    manager = _manager(request)
-    boxes = parse_json_box_list(bbox_list, "bbox_list")
-    indexes = parse_json_int_list(target_region_indexes, "target_region_indexes")
-    result = await _run(
-        manager,
-        lambda worker: worker.read_region_text(
-            image,
-            boxes,
-            indexes,
-            lang=lang,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-        ),
+    return await _region_task(
+        request, image, bbox_list, target_region_indexes, lang, visualize, gen, "read_region_text"
     )
-    return _finalize(result, image, boxes, visualize)
 
 
 @router.post("/predict", response_model=InferenceResponse)
@@ -319,23 +280,11 @@ async def predict(
         None, description="Optional JSON candidate boxes for region-aware prompts."
     ),
     visualize: bool = Form(False),
-    max_new_tokens: int = Form(2048),
-    temperature: float = Form(0.0),
-    top_p: float = Form(1.0),
-    repetition_penalty: float = Form(1.0),
+    gen: dict = Depends(_generation_params),
 ) -> InferenceResponse:
     manager = _manager(request)
     boxes = parse_json_box_list(bbox_list, "bbox_list")
     result = await _run(
-        manager,
-        lambda worker: worker.predict(
-            image,
-            prompt,
-            bbox_list=boxes,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-        ),
+        manager, lambda worker: worker.predict(image, prompt, bbox_list=boxes, **gen)
     )
     return _finalize(result, image, boxes, visualize)

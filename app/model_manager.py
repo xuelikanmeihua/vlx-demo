@@ -38,7 +38,14 @@ class ModelManager:
 
     @property
     def device(self) -> str:
+        """Resolve and return the device. Blocking on first call — see `adevice`."""
         self._ensure_device_resolved()
+        return str(self._device)
+
+    async def adevice(self) -> str:
+        """Async-safe equivalent of `device`; resolves off the event loop."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._executor, self._ensure_device_resolved)
         return str(self._device)
 
     def _ensure_device_resolved(self) -> None:
@@ -82,12 +89,15 @@ class ModelManager:
 
     async def propose_boxes(self, image: Image.Image) -> List[List[float]]:
         """Generate WeDetect-Uni region proposals for ``image`` (pixel xyxy)."""
-        self._ensure_device_resolved()
-        from app.vendor import load_wedetect_proposals
-
         loop = asyncio.get_running_loop()
 
         def _call() -> List[List[float]]:
+            # Resolved here, inside the executor: the first call imports
+            # app.vendor (torch/transformers/the vendored submodule), which
+            # is blocking and must not run on the event-loop thread.
+            self._ensure_device_resolved()
+            from app.vendor import load_wedetect_proposals
+
             return load_wedetect_proposals(
                 image, self._settings.resolved_detector_checkpoint, device=self._device
             )
