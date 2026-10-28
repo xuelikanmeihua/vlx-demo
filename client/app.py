@@ -28,9 +28,14 @@ DEFAULT_BASE_URL = "http://117.50.199.161:8000"
 # --------------------------------------------------------------------------
 
 def _image_file_tuple(image: Image.Image) -> tuple[str, bytes, str]:
+    # JPEG, not PNG: PNG is lossless and can easily blow past the server's
+    # 15MB image / 20MB request-body limits for an ordinary photo, where
+    # JPEG at quality 90 stays a fraction of the size for the same content.
+    if image.mode != "RGB":
+        image = image.convert("RGB")
     buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    return ("upload.png", buf.getvalue(), "image/png")
+    image.save(buf, format="JPEG", quality=90)
+    return ("upload.jpg", buf.getvalue(), "image/jpeg")
 
 
 def _call_api(
