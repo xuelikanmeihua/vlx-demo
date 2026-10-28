@@ -1,0 +1,26 @@
+services:
+  vlx-seek-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: vlx-demo/vlx-seek-api:latest
+    container_name: vlx-seek-api
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist downloaded weights/detector checkpoints across restarts.
+      - ./resources:/workspace/resources
+      - huggingface-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  huggingface-cache:
