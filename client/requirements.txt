@@ -1,0 +1,5 @@
+# Local test-client deps only. No torch/transformers here on purpose --
+# this talks to the deployed API over HTTP and runs fine on a laptop.
+gradio>=4.44
+requests>=2.31
+pillow>=10.0
