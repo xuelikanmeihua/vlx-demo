@@ -49,6 +49,27 @@ def _load_cli_module():
 _ensure_on_path()
 _cli = _load_cli_module()
 
+import vlx_seek.hardware as _hardware  # noqa: E402
+
+
+def _attention_implementation_sdpa_only(device):
+    """Replace upstream's CUDA/NPU choice of flash_attention_2 with SDPA.
+
+    No flash-attn wheel is published for this deployment's exact
+    torch/CUDA/Python ABI, and building it from source needs a full CUDA
+    toolkit (nvcc) this host doesn't have. SDPA is PyTorch's built-in
+    equivalent attention kernel -- functionally identical, just slower --
+    so every backend uses it instead. Builder/encoder code elsewhere in the
+    submodule picks this up via `from vlx_seek.hardware import
+    attention_implementation`, which binds to whatever this attribute holds
+    at the time each module is first imported, so this patch must run (as
+    it does here) before any of that code is imported.
+    """
+    return "sdpa"
+
+
+_hardware.attention_implementation = _attention_implementation_sdpa_only
+
 from vlx_seek.hardware import resolve_device  # noqa: E402
 from vlx_seek.task_templates import list_langs, list_tasks  # noqa: E402
 from vlx_seek_worker import VLXSeekWorker  # noqa: E402
